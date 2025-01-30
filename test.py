@@ -37,6 +37,61 @@ class TestWorkingDayCroniter(unittest.TestCase):
             (res.day == 15 or (res.weekday() < 5 and res not in self.holidays)) for res in results
         ))
 
+    def test_get_prev_working_day(self):
+        cron = WorkingDayCroniter("0 0 1W * *", self.base_date, holidays=self.holidays)
+        results = []
+        for _ in range(5):
+            results.append(cron.get_prev(datetime))
+        self.assertEqual(len(results), 5)
+        # All results should be working days (not weekend/holiday) and the first working day of their month
+        self.assertTrue(all(res.weekday() < 5 and res not in self.holidays for res in results))
+        for res in results:
+            # Calculate expected first working day of the month
+            month_start = res.replace(day=1)
+            first_working_day = None
+            for day in range(1, 32):
+                try:
+                    candidate = month_start.replace(day=day)
+                except ValueError:
+                    break  # End of month
+                if candidate.weekday() < 5 and candidate not in self.holidays:
+                    first_working_day = candidate
+                    break
+            self.assertEqual(res, first_working_day, f"Failed for {res}")
+
+    def test_get_prev_normal_day(self):
+        cron = WorkingDayCroniter("0 0 15 * *", self.base_date, holidays=self.holidays)
+        results = []
+        for _ in range(5):
+            results.append(cron.get_prev(datetime))
+        self.assertEqual(len(results), 5)
+        # All results should be the 15th of the month (regardless of weekends/holidays)
+        self.assertTrue(all(res.day == 15 for res in results))
+
+    def test_combined_working_and_normal_days_prev(self):
+        cron = WorkingDayCroniter("0 0 15,1W * *", self.base_date, holidays=self.holidays)
+        results = []
+        for _ in range(10):
+            results.append(cron.get_prev(datetime))
+        self.assertEqual(len(results), 10)
+        # Each result must be either the 15th or the first working day of its month
+        for res in results:
+            if res.day == 15:
+                continue  # Normal day, no further checks
+            else:
+                # Check if it's the first working day of the month
+                month_start = res.replace(day=1)
+                first_working_day = None
+                for day in range(1, 32):
+                    try:
+                        candidate = month_start.replace(day=day)
+                    except ValueError:
+                        break
+                    if candidate.weekday() < 5 and candidate not in self.holidays:
+                        first_working_day = candidate
+                        break
+                self.assertEqual(res, first_working_day, f"Failed for {res}")
+
 
 class TestDailyExecutionAnalyzer(unittest.TestCase):
     def test_detect_working_day_pattern(self):
