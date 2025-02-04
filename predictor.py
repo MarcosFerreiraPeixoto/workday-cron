@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta
 import calendar
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Union
 from collections import Counter
 from croniter import croniter
 from functools import lru_cache
@@ -9,124 +9,141 @@ import threading
 
 
 class WorkingDayCroniter:
-    def __init__(self, expr: str, base: datetime, holidays: Optional[List[datetime]] = None):
-        """
-        Initialize the WorkingDayCroniter instance.
-
-        :param expr: A cron expression, supporting 'W' for the nth working days of the month.
-        :param base: The base datetime to calculate from.
-        :param holidays: A list of dates that are considered holidays.
-        """
-        self.expr = expr
+    def __init__(self, expr: Union[str, List[str]], base: datetime, holidays: Optional[List[datetime]] = None):
+        if isinstance(expr, list):
+            self.expressions = expr
+        else:
+            self.expressions = [expr]
         self.base = base
-        self.holidays = set(holidays or [])  # Use a set for faster lookups
-        self._state = threading.local()  # Thread-local storage for state
-        self._state.last_date = None  # Initialize thread-local last_date
-        self._raise_if_invalid_expr(expr)
+        self.holidays = set(holidays or [])
+        self._state = threading.local()
+        self._state.last_date = None
 
-        self._is_working_day_expr = "W" in expr
-        self._cron_iter = None if self._is_working_day_expr else croniter(expr, base)
+        # for expr in self.expressions:
+        #     self._raise_if_invalid_expr(expr)
+
+        self._has_working_day_expr = any("W" in expr for expr in self.expressions)
+
+        if len(self.expressions) == 1:
+            expr = self.expressions[0]
+            self._is_working_day_expr = "W" in expr
+            if self._is_working_day_expr:
+                self._cron_iter = None
+            else:
+                self._cron_iter = croniter(expr, base)
+        else:
+            self._cron_iter = None
 
     def _raise_if_invalid_expr(self, expr: str):
-        """
-        Validate the cron expression.
-        """
         expr_parts = deepcopy(expr).split()
-
         if len(expr_parts) != 5:
             raise ValueError("Cron expression must have exactly 5 parts.")
 
-        days_expr_part = expr_parts[2].split(",")
-        for day in days_expr_part:
-            if day.endswith("W"):
+        days_part = expr_parts[2]
+        for day in days_part.split(","):
+            if "W" in day:
+                w_part = day.replace("W", "")
+                if not w_part:
+                    raise ValueError(f"Invalid working day number in expression: {day}")
                 try:
-                    int(day[:-1])
+                    int(w_part)
                 except ValueError:
                     raise ValueError(f"Invalid working day number in expression: {day}")
 
-        expr_parts[2].replace("W","")
-
-        cron_expression_to_validade = " ".join(expr_parts)
-        croniter.is_valid(cron_expression_to_validade)
-
+        expr_to_validate = " ".join(expr_parts)
+        if not croniter.is_valid(expr_to_validate):
+            raise ValueError(f"Invalid cron expression: {expr}")
 
     def get_next(self, date_class=datetime) -> datetime:
-        """
-        Get the next occurrence based on the custom cron expression.
-        Handles both standard cron logic and 'W' working day logic.
-        """
+        if len(self.expressions) == 1:
+            return self._handle_single_expression(date_class)
+        else:
+            return self._handle_multiple_expressions(date_class)
+
+    def _handle_single_expression(self, date_class):
         if not self._is_working_day_expr:
             return self._cron_iter.get_next(date_class)
 
         cron_expr = self._get_base_cron_expr()
-        working_days = self._parse_working_days(self.expr.split()[2])
-        normal_days = self._parse_normal_days(self.expr.split()[2])
+        working_days = self._parse_working_days(self.expressions[0].split()[2])
+        normal_days = self._parse_normal_days(self.expressions[0].split()[2])
         iter_base = croniter(cron_expr, self._state.last_date or self.base)
 
-        max_iterations = 1500  # To prevent infinite loops in case of invalid expressions
+        max_iterations = 1500
         for _ in range(max_iterations):
             candidate_date = iter_base.get_next(date_class)
             if self._matches_working_day(candidate_date, working_days) or \
                self._matches_normal_day(candidate_date, normal_days):
                 self._state.last_date = candidate_date
                 return candidate_date
+        raise RuntimeError("Exceeded maximum iterations while finding the next valid date.")
+
+    def _handle_multiple_expressions(self, date_class):
+        max_iterations = 1500
+        start_date = self._state.last_date or self.base
+
+        # Initialize iterators once and reuse them
+        iterators = []
+        for expr in self.expressions:
+            iterator = WorkingDayCroniter(expr, start_date, self.holidays)
+            iterators.append(iterator)
+
+        # Get the first candidate dates from all iterators
+        current_dates = [iterator.get_next(date_class) for iterator in iterators]
+        candidate = max(current_dates)
+        iterations = 0
+
+        while iterations < max_iterations:
+            
+            # Check if all dates match the candidate
+            if all(d == candidate for d in current_dates):
+                self._state.last_date = candidate
+                return candidate
+
+            # Advance iterators that are behind the candidate
+            for i in range(len(current_dates)):
+                while current_dates[i] < candidate:
+                    try:
+                        current_dates[i] = iterators[i].get_next(date_class)
+                    except RuntimeError:
+                        break  # Handle potential errors from individual iterators
+
+            # Update candidate to the new maximum
+            new_candidate = max(current_dates)
+            candidate = new_candidate
+            iterations += 1
+
 
         raise RuntimeError("Exceeded maximum iterations while finding the next valid date.")
 
     def _get_base_cron_expr(self) -> str:
-        """
-        Replace 'W' in the cron expression with '*' to get a base expression for iteration.
-        """
-        parts = self.expr.split()
+        parts = self.expressions[0].split()
         if "W" in parts[2]:
             parts[2] = "*"
         return " ".join(parts)
 
     def _parse_working_days(self, day_of_month: str) -> List[int]:
-        """
-        Parse the day-of-month field to extract multiple working days.
-
-        :param day_of_month: The day-of-month field from the cron expression.
-        :return: A list of working day numbers (e.g., [3, 5] for "3W,5W").
-        """
         return [int(part.replace("W", "")) for part in day_of_month.split(",") if "W" in part]
 
     def _parse_normal_days(self, day_of_month: str) -> List[int]:
-        """
-        Parse the day-of-month field to extract regular days.
-
-        :param day_of_month: The day-of-month field from the cron expression.
-        :return: A list of regular day numbers.
-        """
         return [int(part) for part in day_of_month.split(",") if part.isdigit()]
 
     def _matches_working_day(self, date: datetime, working_days: List[int]) -> bool:
-        """
-        Check if the date matches the working day criteria.
-        """
         if date.weekday() >= 5 or date in self.holidays:
             return False
         return self._get_nth_working_day(date) in working_days
 
     def _matches_normal_day(self, date: datetime, normal_days: List[int]) -> bool:
-        """
-        Check if the date matches the normal day criteria.
-        """
         return date.day in normal_days
 
     def _get_nth_working_day(self, date: datetime) -> int:
-        """
-        Determine the nth working day of the month for a given date.
-        """
         month_start = date.replace(day=1)
         nth_working_day = 0
-
         for day in range(1, date.day + 1):
             try:
                 candidate = month_start.replace(day=day)
             except ValueError:
-                break  # Reached the end of the month
-
+                break
             if candidate.weekday() < 5 and candidate not in self.holidays:
                 nth_working_day += 1
                 if candidate == date:
