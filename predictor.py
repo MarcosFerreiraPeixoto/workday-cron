@@ -7,6 +7,12 @@ from functools import lru_cache
 from copy import deepcopy
 import threading
 
+import threading
+from datetime import datetime, timedelta
+from typing import List, Optional, Union, Tuple
+from copy import deepcopy
+from croniter import croniter
+
 class WorkingDayCroniter:
     def __init__(
         self,
@@ -34,7 +40,7 @@ class WorkingDayCroniter:
             self._parse_single_expression(expr)
 
     def _parse_single_expression(self, expr: str):
-        """Processa expressões cron simples (com ou sem 'W')."""
+        """Processes single cron expressions (with or without 'W'/'LW')."""
         self._raise_if_invalid_expr(expr)
         self._has_working_day = "W" in expr
         if self._has_working_day:
@@ -88,6 +94,8 @@ class WorkingDayCroniter:
         days_part = expr_parts[2]
         for day in days_part.split(","):
             if "W" in day:
+                if day == "LW":
+                    continue  # LW is valid, skip further checks
                 w_part = day.replace("W", "")
                 if not w_part:
                     raise ValueError(f"Invalid working day number in expression: {day}")
@@ -96,12 +104,10 @@ class WorkingDayCroniter:
                 except ValueError:
                     raise ValueError(f"Invalid working day number in expression: {day}")
         
-        expr_parts[2] = days_part.replace("W", "")
-
+        expr_parts[2] = days_part.replace("W", "").replace("LW", "*")  # Handle LW in cron validation
         expr_to_validate = " ".join(expr_parts)
         if not croniter.is_valid(expr_to_validate):
             raise ValueError(f"Invalid cron expression: {expr}")
-    
 
     def get_next(self, date_class=datetime) -> datetime:
         if self._is_logical_node:
@@ -183,23 +189,59 @@ class WorkingDayCroniter:
 
     def _get_base_cron_expr(self) -> str:
         parts = self.expr.split()
-        if "W" in parts[2]:
+        if "W" in parts[2] or "LW" in parts[2]:
             parts[2] = "*"
         return " ".join(parts)
 
-    def _parse_working_days(self, day_of_month: str) -> List[int]:
-        return [int(part.replace("W", "")) for part in day_of_month.split(",") if "W" in part]
+    def _parse_working_days(self, day_of_month: str) -> List[Union[int, str]]:
+        working_days = []
+        for part in day_of_month.split(','):
+            if 'W' in part:
+                if part == 'LW':
+                    working_days.append('LW')
+                else:
+                    num_part = part.replace('W', '')
+                    try:
+                        working_days.append(int(num_part))
+                    except ValueError:
+                        pass  # Handled in validation
+        return working_days
 
     def _parse_normal_days(self, day_of_month: str) -> List[int]:
-        return [int(part) for part in day_of_month.split(",") if part.isdigit()]
+        return [int(part) for part in day_of_month.split(',') if part.isdigit()]
 
-    def _matches_working_day(self, date: datetime, working_days: List[int]) -> bool:
-        if date.weekday() >= 5 or date in self.holidays:
+    def _matches_working_day(self, date: datetime, working_days: List[Union[int, str]]) -> bool:
+        if not self._is_working_day(date):
             return False
-        return self._get_nth_working_day(date) in working_days
+        nth = self._get_nth_working_day(date)
+        is_last = self._is_last_working_day(date)
+        for wd in working_days:
+            if isinstance(wd, int) and nth == wd:
+                return True
+            elif wd == 'LW' and is_last:
+                return True
+        return False
 
     def _matches_normal_day(self, date: datetime, normal_days: List[int]) -> bool:
         return date.day in normal_days
+
+    def _is_working_day(self, date: datetime) -> bool:
+        return date.weekday() < 5 and date not in self.holidays
+
+    def _is_last_working_day(self, date: datetime) -> bool:
+        if not self._is_working_day(date):
+            return False
+        current_day = date + timedelta(days=1)
+        end_of_month = self._last_day_of_month(date)
+        while current_day <= end_of_month:
+            if self._is_working_day(current_day):
+                return False
+            current_day += timedelta(days=1)
+        return True
+
+    def _last_day_of_month(self, dt: datetime) -> datetime:
+        next_month = dt.replace(day=28) + timedelta(days=4)
+        return next_month - timedelta(days=next_month.day)
 
     def _get_nth_working_day(self, date: datetime) -> int:
         month_start = date.replace(day=1)
@@ -209,12 +251,11 @@ class WorkingDayCroniter:
                 candidate = month_start.replace(day=day)
             except ValueError:
                 break
-            if candidate.weekday() < 5 and candidate not in self.holidays:
+            if self._is_working_day(candidate):
                 nth_working_day += 1
                 if candidate == date:
                     return nth_working_day
         return 0
-
 
 class MonthlyExecutionAnalyzer:
     def __init__(self, historical_data: List[datetime], threshold: float = 0.8, deviation: int = 3):
