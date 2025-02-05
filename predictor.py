@@ -1,38 +1,84 @@
 from datetime import datetime, timedelta
 import calendar
-from typing import List, Dict, Optional, Any, Union
+from typing import List, Dict, Optional, Any, Union, Tuple
 from collections import Counter
 from croniter import croniter
 from functools import lru_cache
 from copy import deepcopy
 import threading
 
-
 class WorkingDayCroniter:
-    def __init__(self, expr: Union[str, List[str]], base: datetime, holidays: Optional[List[datetime]] = None):
-        if isinstance(expr, list):
-            self.expressions = expr
-        else:
-            self.expressions = [expr]
+    def __init__(
+        self,
+        expr: Union[str, List, Tuple],
+        base: datetime,
+        holidays: Optional[List[datetime]] = None
+    ):
         self.base = base
         self.holidays = set(holidays or [])
         self._state = threading.local()
         self._state.last_date = None
 
-        # for expr in self.expressions:
-        #     self._raise_if_invalid_expr(expr)
+        self.expr = expr if isinstance(expr, str) else None
 
-        self._has_working_day_expr = any("W" in expr for expr in self.expressions)
-
-        if len(self.expressions) == 1:
-            expr = self.expressions[0]
-            self._is_working_day_expr = "W" in expr
-            if self._is_working_day_expr:
-                self._cron_iter = None
-            else:
-                self._cron_iter = croniter(expr, base)
+        if isinstance(expr, (list, tuple)):
+            self.operator = expr[0].upper() if isinstance(expr, tuple) else "AND"
+            self.children = [
+                WorkingDayCroniter(e, base, holidays) 
+                for e in (expr[1:] if isinstance(expr, tuple) else expr)
+            ]
+            self._is_logical_node = True
         else:
+            self.operator = None
+            self._is_logical_node = False
+            self._parse_single_expression(expr)
+
+    def _parse_single_expression(self, expr: str):
+        """Processa expressões cron simples (com ou sem 'W')."""
+        self._raise_if_invalid_expr(expr)
+        self._has_working_day = "W" in expr
+        if self._has_working_day:
             self._cron_iter = None
+        else:
+            self._cron_iter = croniter(expr, self.base)
+
+    def _handle_single_expression(self, date_class):
+        if not self._has_working_day:
+            return self._cron_iter.get_next(date_class)
+
+        cron_expr = self._get_base_cron_expr()
+        working_days = self._parse_working_days(self.expr.split()[2])
+        normal_days = self._parse_normal_days(self.expr.split()[2])
+        iter_base = croniter(cron_expr, self._state.last_date or self.base)
+
+        max_iterations = 1500
+        for _ in range(max_iterations):
+            candidate_date = iter_base.get_next(date_class)
+            if self._matches_working_day(candidate_date, working_days) or \
+               self._matches_normal_day(candidate_date, normal_days):
+                self._state.last_date = candidate_date
+                return candidate_date
+        raise RuntimeError("Exceeded maximum iterations while finding the next valid date.")
+
+    def _handle_single_expression_prev(self, date_class):
+        if not self._has_working_day:
+            return self._cron_iter.get_prev(date_class)
+
+        cron_expr = self._get_base_cron_expr()
+        working_days = self._parse_working_days(self.expr.split()[2])
+        normal_days = self._parse_normal_days(self.expr.split()[2])
+
+        start_date = self._state.last_date if self._state.last_date else self.base
+        iter_base = croniter(cron_expr, start_date)
+
+        max_iterations = 1500
+        for _ in range(max_iterations):
+            candidate_date = iter_base.get_prev(date_class)
+            if self._matches_working_day(candidate_date, working_days) or \
+               self._matches_normal_day(candidate_date, normal_days):
+                self._state.last_date = candidate_date
+                return candidate_date
+        raise RuntimeError("Exceeded maximum iterations while finding the previous valid date.")
 
     def _raise_if_invalid_expr(self, expr: str):
         expr_parts = deepcopy(expr).split()
@@ -49,75 +95,94 @@ class WorkingDayCroniter:
                     int(w_part)
                 except ValueError:
                     raise ValueError(f"Invalid working day number in expression: {day}")
+        
+        expr_parts[2] = days_part.replace("W", "")
 
         expr_to_validate = " ".join(expr_parts)
         if not croniter.is_valid(expr_to_validate):
             raise ValueError(f"Invalid cron expression: {expr}")
+    
 
     def get_next(self, date_class=datetime) -> datetime:
-        if len(self.expressions) == 1:
-            return self._handle_single_expression(date_class)
+        if self._is_logical_node:
+            return self._handle_logical_node(date_class)
         else:
-            return self._handle_multiple_expressions(date_class)
+            return self._handle_single_expression(date_class)
 
-    def _handle_single_expression(self, date_class):
-        if not self._is_working_day_expr:
-            return self._cron_iter.get_next(date_class)
+    def get_prev(self, date_class=datetime) -> datetime:
+        if self._is_logical_node:
+            return self._handle_logical_node_prev(date_class)
+        else:
+            return self._handle_single_expression_prev(date_class)
 
-        cron_expr = self._get_base_cron_expr()
-        working_days = self._parse_working_days(self.expressions[0].split()[2])
-        normal_days = self._parse_normal_days(self.expressions[0].split()[2])
-        iter_base = croniter(cron_expr, self._state.last_date or self.base)
+    def _handle_logical_node(self, date_class):
+        if self.operator == "OR":
+            next_dates = [child.get_next(date_class) for child in self.children]
+            minimum = min(next_dates)
+            for i in range(len(next_dates)):
+                if next_dates[i] != minimum:
+                    self.children[i].get_prev(date_class)
+            return minimum
+        elif self.operator == "AND":
+            return self._sync_and_dates(date_class)
+        else:
+            raise ValueError(f"Unsupported operator: {self.operator}")
 
+    def _handle_logical_node_prev(self, date_class):
+        if self.operator == "OR":
+            prev_dates = [child.get_prev(date_class) for child in self.children]
+            max_date = max(prev_dates)
+            for i in range(len(prev_dates)):
+                if prev_dates[i] != max_date:
+                    self.children[i].get_next(date_class)
+            return max_date
+        elif self.operator == "AND":
+            return self._sync_and_dates_prev(date_class)
+        else:
+            raise ValueError(f"Unsupported operator: {self.operator}")
+
+    def _sync_and_dates(self, date_class):
         max_iterations = 1500
-        for _ in range(max_iterations):
-            candidate_date = iter_base.get_next(date_class)
-            if self._matches_working_day(candidate_date, working_days) or \
-               self._matches_normal_day(candidate_date, normal_days):
-                self._state.last_date = candidate_date
-                return candidate_date
-        raise RuntimeError("Exceeded maximum iterations while finding the next valid date.")
-
-    def _handle_multiple_expressions(self, date_class):
-        max_iterations = 1500
-        start_date = self._state.last_date or self.base
-
-        # Initialize iterators once and reuse them
-        iterators = []
-        for expr in self.expressions:
-            iterator = WorkingDayCroniter(expr, start_date, self.holidays)
-            iterators.append(iterator)
-
-        # Get the first candidate dates from all iterators
-        current_dates = [iterator.get_next(date_class) for iterator in iterators]
+        current_dates = [child.get_next(date_class) for child in self.children]
         candidate = max(current_dates)
         iterations = 0
 
         while iterations < max_iterations:
-            
-            # Check if all dates match the candidate
+            if all(d == candidate for d in current_dates):
+                return candidate
+
+            for i, date in enumerate(current_dates):
+                while date < candidate:
+                    current_dates[i] = self.children[i].get_next(date_class)
+                    date = current_dates[i]
+
+            candidate = max(current_dates)
+            iterations += 1
+
+        raise RuntimeError("Exceeded maximum iterations for AND logic.")
+
+    def _sync_and_dates_prev(self, date_class):
+        max_iterations = 1500
+        current_dates = [child.get_prev(date_class) for child in self.children]
+        candidate = min(current_dates)
+        iterations = 0
+
+        while iterations < max_iterations:
             if all(d == candidate for d in current_dates):
                 self._state.last_date = candidate
                 return candidate
 
-            # Advance iterators that are behind the candidate
             for i in range(len(current_dates)):
-                while current_dates[i] < candidate:
-                    try:
-                        current_dates[i] = iterators[i].get_next(date_class)
-                    except RuntimeError:
-                        break  # Handle potential errors from individual iterators
+                while current_dates[i] > candidate:
+                    current_dates[i] = self.children[i].get_prev(date_class)
 
-            # Update candidate to the new maximum
-            new_candidate = max(current_dates)
-            candidate = new_candidate
+            candidate = min(current_dates)
             iterations += 1
 
-
-        raise RuntimeError("Exceeded maximum iterations while finding the next valid date.")
+        raise RuntimeError("Exceeded maximum iterations for AND logic in get_prev.")
 
     def _get_base_cron_expr(self) -> str:
-        parts = self.expressions[0].split()
+        parts = self.expr.split()
         if "W" in parts[2]:
             parts[2] = "*"
         return " ".join(parts)
